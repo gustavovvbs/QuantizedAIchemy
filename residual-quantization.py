@@ -23,6 +23,42 @@ test_dataset = datasets.FashionMNIST(
 train_dataloader = DataLoader(train_dataset, batch_size=64)
 test_dataloader = DataLoader(test_dataset, batch_size=64)
 
+class ResidualQuantizer(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+        super(ResidualQuantizer, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.commitment_cost = commitment_cost
+
+        self.quant_conv = nn.Conv2d(4, embedding_dim, 1)
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.post_quant_conv = nn.Conv2d(embedding_dim, 4, 1)
+
+    def forward(self, x):
+        # Quantization
+        quant_input = self.quant_conv(x)
+        bs, c, h, w = quant_input.shape
+        quant_input = quant_input.permute(0, 2, 3, 1).contiguous()
+        quant_input = quant_input.view(bs, -1, c)
+        
+        dist = torch.cdist(quant_input, self.embedding.weight[None, :].repeat((quant_input.size(0), 1, 1)))
+        min_encoding_indices = torch.argmin(dist, dim=-1)
+        
+        quantized_space = self.embedding.weight[min_encoding_indices]
+        quantized_space = quantized_space.view(bs, h, w, c).permute(0, 3, 1, 2)
+        quant_input = quant_input.view(bs, h, w, c).permute(0, 3, 1, 2)
+        
+        # Compute losses
+        commit_loss = torch.mean((quantized_space.detach() - quant_input).pow(2))
+        codebook_loss = torch.mean((quantized_space - quant_input.detach()).pow(2))
+        total_loss = codebook_loss + self.commitment_cost * commit_loss
+        
+        # Update residual
+        quantized_space = quant_input + (quantized_space - quant_input).detach()
+        updated_residual = x - self.post_quant_conv(quantized_space)
+
+        return updated_residual, total_loss
+
 class ResidualVQVAE(nn.Module):
     def __init__(self, num_residual_blocks=2):
         super().__init__()
@@ -36,14 +72,7 @@ class ResidualVQVAE(nn.Module):
         )
 
         self.num_residual_blocks = num_residual_blocks
-        self.residual_quantizers = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(4, 2, 1),
-                nn.Embedding(3, 2),
-                nn.Conv2d(2, 4, 1)
-            )
-            for _ in range(num_residual_blocks)
-        ])
+        self.residual_quantizers = nn.ModuleList([ResidualQuantizer(3, 2, 0.25) for _ in range(num_residual_blocks)])
 
         self._commitment_cost = 0.25
 
@@ -61,27 +90,8 @@ class ResidualVQVAE(nn.Module):
         total_loss = 0
 
         for quantizer in self.residual_quantizers:
-            quant_input = quantizer[0](residual)
-            bs, c, h, w = quant_input.shape
-            quant_input = quant_input.permute(0, 2, 3, 1).contiguous()
-            quant_input = quant_input.view(quant_input.size(0), -1, c)
-
-            dist = torch.cdist(quant_input, quantizer[1].weight[None, :].repeat((quant_input.size(0), 1, 1)))
-            min_encoding_indices = torch.argmin(dist, dim=-1)
-
-            quantized_space = quantizer[1].weight[min_encoding_indices]
-            quantized_space = quantized_space.view(bs, h, w, c).permute(0, 3, 1, 2)
-            quant_input = quant_input.view(bs, h, w, c).permute(0, 3, 1, 2)
-
-            # ensure encoder makes use of the quantized space
-            commit_loss = torch.mean((quantized_space.detach() - quant_input).pow(2))
-            #push the quantized embeddings to the encoder output space
-            codebook_loss = torch.mean((quantized_space - quant_input.detach()).pow(2))
-            total_loss += codebook_loss + self._commitment_cost * commit_loss
-
-            # residual update
-            quantized_space = quant_input + (quantized_space - quant_input).detach()
-            residual = residual - quantizer[2](quantized_space)
+            residual, loss = quantizer(residual)
+            total_loss += loss
 
         decoded_data = self.decoder(encoded_data - residual)
         return decoded_data, total_loss
