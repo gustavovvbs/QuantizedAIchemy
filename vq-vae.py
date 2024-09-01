@@ -5,8 +5,8 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import ToTensor, Lambda 
 import matplotlib.pyplot as plt 
 import torchvision
+from tqdm import tqdm
 
-from quantizer import VectorQuantizer
 
 
 train_dataset = datasets.FashionMNIST(
@@ -27,118 +27,105 @@ train_dataloader = DataLoader(train_dataset, batch_size = 64)
 
 test_dataloader = DataLoader(test_dataset, batch_size = 64) 
 
-class Encoder(nn.Module):
-    def __init__(self, hid_dim = 64, feat_dim = 128, CHANNELS = 1):
+class VQVAE(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.hid_dim = hid_dim 
-        self.feat_dim = feat_dim 
-        self.encoder_stack = nn.Sequential(
-            nn.Conv2d(CHANNELS, hid_dim, 4, 2, 1),
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, 4, 2, 1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
-            nn.Conv2d(hid_dim, hid_dim, 4, 2, 1),
+            nn.Conv2d(16, 4, 4, 2, 1),
+            nn.BatchNorm2d(4),
             nn.ReLU(),
-            nn.Conv2d(hid_dim, feat_dim, 1),
-            nn.ReLU()
         )
 
-    def forward(self, x):
-        
-        return self.encoder_stack(x) #(bs, feat_dim, h, w)
+        self.pre_quantization_conv = nn.Conv2d(4, 2, 1)
+        self.embeddings = nn.Embedding(3, 2)
+        self.post_quantization_conv = nn.Conv2d(2, 4, 1)
 
-class Decoder(nn.Module):
-    def __init__(self, hid_dim = 64, feat_dim = 128, CHANNELS = 1):
-        super().__init__()
-        self.hid_dim = hid_dim 
-        self.feat_dim = feat_dim 
-        self.decoder_stack = nn.Sequential(
-            nn.ConvTranspose2d(feat_dim, hid_dim, 1),
+        self._commitment_cost = 0.25
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(4, 16, 4, 2, 1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
-            nn.ConvTranspose2d(hid_dim, hid_dim, 4, 2, 1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(hid_dim, CHANNELS, 4, 2, 1),
+            nn.ConvTranspose2d(16, 1, 4, 2, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        return self.decoder_stack(x)
+        encoded_data = self.encoder(x)
 
-class VQVAE(nn.Module):
-    def __init__(self, encoder, decoder, commitment_cost, num_embeddings, quantizer):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder 
-        self.quantizer = quantizer 
-        self.commitment_cost = commitment_cost
-        self.num_embeddings = num_embeddings
+        quant_input = self.pre_quantization_conv(encoded_data)
 
-    def forward(self, x):
-        z = self.encoder(x)
-        quantized = self.quantizer(z)
-        quantized = quantized.view(-1, self.encoder.feat_dim, z.shape[2], z.shape[3])
-        x_recon = self.decoder(quantized)
+        bs, c, h, w = quant_input.shape
+        quant_input = quant_input.permute(0, 2, 3, 1).contiguous()
 
-        return x_recon
+        quant_input = quant_input.view(quant_input.size(0), -1, c)
+
+        dist = torch.cdist(quant_input, self.embeddings.weight[None, :].repeat((quant_input.size(0), 1, 1))) # (bs, h*w, n_embed)
+        
+        min_encoding_indices = torch.argmin(dist, dim=-1)
+
+        quantized_space = self.embeddings.weight[min_encoding_indices]
+
+        quantized_space = quantized_space.reshape(bs, h, w, c).permute(0, 3, 1, 2)
+        quant_input = quant_input.view(bs, h, w, c).permute(0, 3, 1, 2)
+
+        #make encoding variables push to the quantized embeddings
+        commit_loss = torch.mean((quantized_space.detach() - quant_input).pow(2))
+
+        #push the quantized embeddings to the latent encoded spaces
+        codebook_loss = torch.mean((quantized_space - quant_input.detach()).pow(2))
+
+        #add a term to control how the codebook terms are going to be modified in the loss
+        loss = codebook_loss + self._commitment_cost*commit_loss
+
+        quantized_space = quant_input + (quantized_space - quant_input).detach()
+
+        decoder_input = self.post_quantization_conv(quantized_space)
+
+        decoded_data = self.decoder(decoder_input)
+
+        return decoded_data, loss 
 
 
-def train_step(dataloader, model, optimizer, loss_fn, device = 'cuda'):
-    model.train()
-    total = len(dataloader)
-    for idx, (data, _) in enumerate(dataloader):
-        data = data.to(device)
+EPOCHS = 10
+device = 'cuda'
+
+def train_step(model):
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = torch.nn.MSELoss()
+    for im, label in tqdm(train_dataloader):
+        im = im.float().to(device)
         optimizer.zero_grad()
-        recon = model(data)
-        loss = loss_fn(recon, data)
+        out, quantize_loss = model(im)
+        recon_loss = loss_fn(out, im)
+        loss = recon_loss + quantize_loss
         loss.backward()
         optimizer.step()
 
-        if idx % 100 == 0:
-            print(f'Batch {idx} / {total} Loss {loss.item()}')
-
-def test_step(dataloader, model, loss_fn, device = 'cuda'):
-    model.eval()
-    total = len(dataloader)
-    with torch.no_grad():
-        for idx, (data, _) in enumerate(dataloader):
-            data = data.to(device)
-            recon = model(data)
-            loss = loss_fn(recon, data)
-            if idx % 100 == 0:
-                print(f'EVAL Batch {idx} / {total} Loss {loss.item()}')
-
-
-encoder = Encoder().to('cuda')
-decoder = Decoder().to('cuda')
-quantizer = VectorQuantizer(512, 128, 0.25).to('cuda')
-model = VQVAE(encoder, decoder, 0.25, 512, quantizer).to('cuda')
-optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4)
-loss_fn = nn.MSELoss()
-EPOCHS = 50
+model = VQVAE().to(device)
 
 for epoch in range(EPOCHS):
-    print(f'Epoch {epoch}/{EPOCHS}')
-    train_step(train_dataloader, model, optimizer, loss_fn)
-    test_step(test_dataloader, model, loss_fn)
+    train_step(model)
+    print(f'EPOCH: {epoch+1}/{EPOCHS}')
 
-encoded = model.encoder(test_dataset[0][0].unsqueeze(0).to('cuda'))
-quantized = model.quantizer(encoded)
-quantized = quantized.view(-1, model.encoder.feat_dim, encoded.shape[2], encoded.shape[3])
-recon = model.decoder(quantized)
-print(recon.shape)  # torch.Size([1, 1, 28, 28])
 
-recon = recon.squeeze().cpu().detach().numpy()
+idxs = torch.randint(0, len(test_dataloader), (100, ))
+imgs = torch.cat([test_dataloader.dataset[idx][0][None, :] for idx in idxs]).float()
+imgs = imgs.to(device)
 
-# Se o tensor tiver 3 canais (como no caso de CIFAR100)
-if recon.shape[0] == 3:
-    recon = recon.transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
+model.eval()
 
-# Exibir a imagem
-plt.imshow(recon, cmap='gray' if recon.shape[-1] == 1 else None)
-plt.title("Reconstruída")
-plt.show()
-
-plt.subplot(1, 2, 1)
-plt.title("Original")
-plt.imshow(test_dataset[0][0].numpy().transpose(1, 2, 0))
-plt.show()
-
+reconstructed = model(imgs)[0]
+imgs = (imgs+1)/2
+reconstructed = 1 - (reconstructed+1)/2
+out = torch.hstack([imgs, reconstructed])
+output = torch.reshape(out, (-1, 1, 28, 28))
+grid = torchvision.utils.make_grid(output.detach().cpu(), nrow=10)
+img = torchvision.transforms.ToPILImage()(grid)
+img.save('reconstruction.png')
+    
 
