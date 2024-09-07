@@ -24,15 +24,15 @@ train_dataloader = DataLoader(train_dataset, batch_size=64)
 test_dataloader = DataLoader(test_dataset, batch_size=64)
 
 class ResidualQuantizer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+    def __init__(self, num_embeddings, z_dim, embedding_dim, commitment_cost):
         super(ResidualQuantizer, self).__init__()
         self.embedding_dim = embedding_dim
         self.num_embeddings = num_embeddings
         self.commitment_cost = commitment_cost
 
-        self.quant_conv = nn.Conv2d(4, embedding_dim, 1)
+        self.quant_conv = nn.Conv2d(z_dim, embedding_dim, 1)
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        self.post_quant_conv = nn.Conv2d(embedding_dim, 4, 1)
+        self.post_quant_conv = nn.Conv2d(embedding_dim, z_dim, 1)
 
     def forward(self, x):
         # Quantization
@@ -96,38 +96,40 @@ class ResidualVQVAE(nn.Module):
         decoded_data = self.decoder(encoded_data - residual)
         return decoded_data, total_loss
 
-EPOCHS = 10
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def train_step(model):
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = torch.nn.MSELoss()
-    for im, _ in tqdm(train_dataloader):
-        im = im.float().to(device)
-        optimizer.zero_grad()
-        out, quantize_loss = model(im)
-        recon_loss = loss_fn(out, im)
-        loss = recon_loss + quantize_loss
-        loss.backward()
-        optimizer.step()
+if __name__ == '__main__':
+    EPOCHS = 10
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-model = ResidualVQVAE().to(device)
+    def train_step(model):
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        loss_fn = torch.nn.MSELoss()
+        for im, _ in tqdm(train_dataloader):
+            im = im.float().to(device)
+            optimizer.zero_grad()
+            out, quantize_loss = model(im)
+            recon_loss = loss_fn(out, im)
+            loss = recon_loss + quantize_loss
+            loss.backward()
+            optimizer.step()
 
-for epoch in range(EPOCHS):
-    train_step(model)
-    print(f'EPOCH: {epoch+1}/{EPOCHS}')
+    model = ResidualVQVAE().to(device)
 
-idxs = torch.randint(0, len(test_dataloader), (100,))
-imgs = torch.cat([test_dataloader.dataset[idx][0][None, :] for idx in idxs]).float()
-imgs = imgs.to(device)
+    for epoch in range(EPOCHS):
+        train_step(model)
+        print(f'EPOCH: {epoch+1}/{EPOCHS}')
 
-model.eval()
+    idxs = torch.randint(0, len(test_dataloader), (100,))
+    imgs = torch.cat([test_dataloader.dataset[idx][0][None, :] for idx in idxs]).float()
+    imgs = imgs.to(device)
 
-reconstructed = model(imgs)[0]
-imgs = (imgs + 1) / 2
-reconstructed = 1 - (reconstructed + 1) / 2
-out = torch.hstack([imgs, reconstructed])
-output = torch.reshape(out, (-1, 1, 28, 28))
-grid = torchvision.utils.make_grid(output.detach().cpu(), nrow=10)
-img = torchvision.transforms.ToPILImage()(grid)
-img.save('reconstruction.png')
+    model.eval()
+
+    reconstructed = model(imgs)[0]
+    imgs = (imgs + 1) / 2
+    reconstructed = 1 - (reconstructed + 1) / 2
+    out = torch.hstack([imgs, reconstructed])
+    output = torch.reshape(out, (-1, 1, 28, 28))
+    grid = torchvision.utils.make_grid(output.detach().cpu(), nrow=10)
+    img = torchvision.transforms.ToPILImage()(grid)
+    img.save('reconstruction.png')
